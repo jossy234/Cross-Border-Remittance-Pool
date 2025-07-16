@@ -8,11 +8,18 @@
 (define-constant ERR_INVALID_RECIPIENT (err u106))
 (define-constant ERR_POOL_CLOSED (err u107))
 (define-constant ERR_MINIMUM_BATCH_SIZE (err u108))
+(define-constant ERR_INVALID_TIER (err u109))
 
 (define-constant MAX_BATCH_SIZE u50)
 (define-constant MIN_BATCH_SIZE u5)
 (define-constant POOL_FEE_RATE u100)
 (define-constant BASE_FEE u1000)
+(define-constant BRONZE_TIER_THRESHOLD u10000)
+(define-constant SILVER_TIER_THRESHOLD u50000)
+(define-constant GOLD_TIER_THRESHOLD u100000)
+(define-constant BRONZE_REBATE u500)
+(define-constant SILVER_REBATE u1000)
+(define-constant GOLD_REBATE u2000)
 
 (define-data-var next-pool-id uint u1)
 (define-data-var next-transfer-id uint u1)
@@ -67,8 +74,90 @@
   (list 100 uint)
 )
 
+(define-map user-loyalty-stats
+  principal
+  {
+    total-volume: uint,
+    transaction-count: uint,
+    tier: (string-ascii 10),
+    total-rebates-earned: uint,
+    last-updated: uint
+  }
+)
+
 (define-private (calculate-fee (amount uint))
   (+ BASE_FEE (/ (* amount POOL_FEE_RATE) u10000))
+)
+
+(define-private (get-user-tier (user principal))
+  (let ((stats (default-to {total-volume: u0, transaction-count: u0, tier: "standard", total-rebates-earned: u0, last-updated: u0} (map-get? user-loyalty-stats user))))
+    (let ((volume (get total-volume stats)))
+      (if (>= volume GOLD_TIER_THRESHOLD)
+        "gold"
+        (if (>= volume SILVER_TIER_THRESHOLD)
+          "silver"
+          (if (>= volume BRONZE_TIER_THRESHOLD)
+            "bronze"
+            "standard"
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-private (calculate-rebate (tier (string-ascii 10)))
+  (if (is-eq tier "gold")
+    GOLD_REBATE
+    (if (is-eq tier "silver")
+      SILVER_REBATE
+      (if (is-eq tier "bronze")
+        BRONZE_REBATE
+        u0
+      )
+    )
+  )
+)
+
+(define-private (calculate-discounted-fee (amount uint) (user principal))
+  (let (
+    (base-fee (calculate-fee amount))
+    (user-tier (get-user-tier user))
+    (rebate (calculate-rebate user-tier))
+  )
+    (if (> base-fee rebate)
+      (- base-fee rebate)
+      u0
+    )
+  )
+)
+
+(define-private (update-user-loyalty (user principal) (amount uint))
+  (let (
+    (current-stats (default-to {total-volume: u0, transaction-count: u0, tier: "standard", total-rebates-earned: u0, last-updated: u0} (map-get? user-loyalty-stats user)))
+    (new-volume (+ (get total-volume current-stats) amount))
+    (new-count (+ (get transaction-count current-stats) u1))
+  )
+    (let (
+      (updated-stats {total-volume: new-volume, transaction-count: new-count, tier: "temp", total-rebates-earned: u0, last-updated: u0})
+    )
+      (map-set user-loyalty-stats user updated-stats)
+      (let (
+        (new-tier (get-user-tier user))
+        (rebate-earned (calculate-rebate new-tier))
+        (total-rebates (+ (get total-rebates-earned current-stats) rebate-earned))
+      )
+        (map-set user-loyalty-stats user {
+          total-volume: new-volume,
+          transaction-count: new-count,
+          tier: new-tier,
+          total-rebates-earned: total-rebates,
+          last-updated: stacks-block-height
+        })
+        true
+      )
+    )
+  )
 )
 
 (define-private (update-user-balance (user principal) (amount uint) (operation (string-ascii 10)))
@@ -135,7 +224,7 @@
   (let (
     (pool (unwrap! (map-get? remittance-pools pool-id) ERR_POOL_NOT_FOUND))
     (transfer-id (var-get next-transfer-id))
-    (fee (calculate-fee amount))
+    (fee (calculate-discounted-fee amount tx-sender))
     (total-cost (+ amount fee))
     (user-balance (default-to u0 (map-get? user-balances tx-sender)))
   )
@@ -178,6 +267,7 @@
       )
     )
     
+    (update-user-loyalty tx-sender amount)
     (var-set next-transfer-id (+ transfer-id u1))
     (ok transfer-id)
   )
@@ -253,6 +343,49 @@
       utilization-percent: (/ (* (get batch-count pool) u100) (get max-batch-size pool))
     })
     ERR_POOL_NOT_FOUND
+  )
+)
+
+(define-read-only (get-user-loyalty-tier (user principal))
+  (get-user-tier user)
+)
+
+(define-read-only (get-user-loyalty-stats (user principal))
+  (default-to {total-volume: u0, transaction-count: u0, tier: "standard", total-rebates-earned: u0, last-updated: u0} (map-get? user-loyalty-stats user))
+)
+
+(define-read-only (calculate-user-fee (amount uint) (user principal))
+  (calculate-discounted-fee amount user)
+)
+
+(define-read-only (get-tier-benefits (tier (string-ascii 10)))
+  (ok {
+    tier: tier,
+    rebate-amount: (calculate-rebate tier),
+    threshold-required: (if (is-eq tier "bronze")
+      BRONZE_TIER_THRESHOLD
+      (if (is-eq tier "silver")
+        SILVER_TIER_THRESHOLD
+        (if (is-eq tier "gold")
+          GOLD_TIER_THRESHOLD
+          u0
+        )
+      )
+    )
+  })
+)
+
+(define-public (claim-loyalty-rebate)
+  (let (
+    (user-stats (unwrap! (map-get? user-loyalty-stats tx-sender) (err u404)))
+    (rebates-earned (get total-rebates-earned user-stats))
+  )
+    (asserts! (> rebates-earned u0) (err u405))
+    (try! (as-contract (stx-transfer? rebates-earned tx-sender tx-sender)))
+    (map-set user-loyalty-stats tx-sender (merge user-stats {
+      total-rebates-earned: u0
+    }))
+    (ok rebates-earned)
   )
 )
 
