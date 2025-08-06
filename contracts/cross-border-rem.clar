@@ -9,6 +9,7 @@
 (define-constant ERR_POOL_CLOSED (err u107))
 (define-constant ERR_MINIMUM_BATCH_SIZE (err u108))
 (define-constant ERR_INVALID_TIER (err u109))
+(define-constant ERR_AUTO_RECYCLE_FAILED (err u110))
 
 (define-constant MAX_BATCH_SIZE u50)
 (define-constant MIN_BATCH_SIZE u5)
@@ -38,7 +39,10 @@
     max-batch-size: uint,
     status: (string-ascii 10),
     created-at: uint,
-    processed-at: (optional uint)
+    processed-at: (optional uint),
+    auto-recycle: bool,
+    parent-pool-id: (optional uint),
+    child-pool-id: (optional uint)
   }
 )
 
@@ -211,7 +215,10 @@
       max-batch-size: max-batch-size,
       status: "active",
       created-at: stacks-block-height,
-      processed-at: none
+      processed-at: none,
+      auto-recycle: false,
+      parent-pool-id: none,
+      child-pool-id: none
     })
     (add-pool-to-country destination-country pool-id)
     (var-set next-pool-id (+ pool-id u1))
@@ -386,6 +393,161 @@
       total-rebates-earned: u0
     }))
     (ok rebates-earned)
+  )
+)
+
+(define-private (create-recycled-pool (parent-pool-id uint))
+  (let (
+    (parent-pool (unwrap! (map-get? remittance-pools parent-pool-id) ERR_POOL_NOT_FOUND))
+    (new-pool-id (var-get next-pool-id))
+  )
+    (map-set remittance-pools new-pool-id {
+      creator: (get creator parent-pool),
+      destination-country: (get destination-country parent-pool),
+      exchange-rate: (get exchange-rate parent-pool),
+      total-amount: u0,
+      fee-collected: u0,
+      batch-count: u0,
+      max-batch-size: (get max-batch-size parent-pool),
+      status: "active",
+      created-at: stacks-block-height,
+      processed-at: none,
+      auto-recycle: true,
+      parent-pool-id: (some parent-pool-id),
+      child-pool-id: none
+    })
+    (map-set remittance-pools parent-pool-id (merge parent-pool {
+      child-pool-id: (some new-pool-id)
+    }))
+    (add-pool-to-country (get destination-country parent-pool) new-pool-id)
+    (var-set next-pool-id (+ new-pool-id u1))
+    (var-set total-pools-created (+ (var-get total-pools-created) u1))
+    (ok new-pool-id)
+  )
+)
+
+(define-public (create-auto-recycle-pool (destination-country (string-ascii 3)) (exchange-rate uint) (max-batch-size uint))
+  (let ((pool-id (var-get next-pool-id)))
+    (asserts! (> exchange-rate u0) ERR_INVALID_AMOUNT)
+    (asserts! (and (>= max-batch-size MIN_BATCH_SIZE) (<= max-batch-size MAX_BATCH_SIZE)) ERR_INVALID_AMOUNT)
+    (map-set remittance-pools pool-id {
+      creator: tx-sender,
+      destination-country: destination-country,
+      exchange-rate: exchange-rate,
+      total-amount: u0,
+      fee-collected: u0,
+      batch-count: u0,
+      max-batch-size: max-batch-size,
+      status: "active",
+      created-at: stacks-block-height,
+      processed-at: none,
+      auto-recycle: true,
+      parent-pool-id: none,
+      child-pool-id: none
+    })
+    (add-pool-to-country destination-country pool-id)
+    (var-set next-pool-id (+ pool-id u1))
+    (var-set total-pools-created (+ (var-get total-pools-created) u1))
+    (ok pool-id)
+  )
+)
+
+(define-public (add-transfer-with-auto-recycle (pool-id uint) (recipient (string-ascii 50)) (amount uint))
+  (let (
+    (pool (unwrap! (map-get? remittance-pools pool-id) ERR_POOL_NOT_FOUND))
+    (transfer-id (var-get next-transfer-id))
+    (fee (calculate-discounted-fee amount tx-sender))
+    (total-cost (+ amount fee))
+    (user-balance (default-to u0 (map-get? user-balances tx-sender)))
+  )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> (len recipient) u0) ERR_INVALID_RECIPIENT)
+    (asserts! (>= user-balance total-cost) ERR_INSUFFICIENT_BALANCE)
+    
+    (let ((target-pool-id 
+      (if (and (is-eq (get status pool) "active") (< (get batch-count pool) (get max-batch-size pool)))
+        pool-id
+        (if (get auto-recycle pool)
+          (match (get child-pool-id pool)
+            existing-child existing-child
+            (unwrap! (create-recycled-pool pool-id) ERR_AUTO_RECYCLE_FAILED)
+          )
+          (begin
+            (asserts! (is-eq (get status pool) "active") ERR_POOL_CLOSED)
+            (asserts! (< (get batch-count pool) (get max-batch-size pool)) ERR_BATCH_FULL)
+            pool-id
+          )
+        )
+      )))
+      
+      (let ((target-pool (unwrap! (map-get? remittance-pools target-pool-id) ERR_POOL_NOT_FOUND)))
+        (update-user-balance tx-sender total-cost "subtract")
+        
+        (map-set pool-transfers {pool-id: target-pool-id, transfer-id: transfer-id} {
+          sender: tx-sender,
+          recipient: recipient,
+          amount: amount,
+          fee: fee,
+          status: "pending",
+          created-at: stacks-block-height,
+          processed-at: none
+        })
+        
+        (map-set remittance-pools target-pool-id (merge target-pool {
+          total-amount: (+ (get total-amount target-pool) amount),
+          fee-collected: (+ (get fee-collected target-pool) fee),
+          batch-count: (+ (get batch-count target-pool) u1)
+        }))
+        
+        (let ((participant-key {pool-id: target-pool-id, participant: tx-sender}))
+          (match (map-get? pool-participants participant-key)
+            existing-participant (map-set pool-participants participant-key {
+              total-sent: (+ (get total-sent existing-participant) amount),
+              transfer-count: (+ (get transfer-count existing-participant) u1),
+              joined-at: (get joined-at existing-participant)
+            })
+            (map-set pool-participants participant-key {
+              total-sent: amount,
+              transfer-count: u1,
+              joined-at: stacks-block-height
+            })
+          )
+        )
+        
+        (update-user-loyalty tx-sender amount)
+        (var-set next-transfer-id (+ transfer-id u1))
+        (ok {transfer-id: transfer-id, pool-id: target-pool-id})
+      )
+    )
+  )
+)
+
+(define-read-only (get-active-pool-for-country (country (string-ascii 3)))
+  (let ((pools-list (default-to (list) (map-get? country-pools country))))
+    (fold find-active-pool pools-list none)
+  )
+)
+
+(define-private (find-active-pool (pool-id uint) (current-best (optional uint)))
+  (match (map-get? remittance-pools pool-id)
+    pool (if (and 
+               (is-eq (get status pool) "active") 
+               (< (get batch-count pool) (get max-batch-size pool))
+             )
+           (some pool-id)
+           current-best)
+    current-best
+  )
+)
+
+(define-read-only (get-pool-chain (pool-id uint))
+  (let ((pool (unwrap! (map-get? remittance-pools pool-id) ERR_POOL_NOT_FOUND)))
+    (ok {
+      current-pool: pool-id,
+      parent-pool: (get parent-pool-id pool),
+      child-pool: (get child-pool-id pool),
+      auto-recycle-enabled: (get auto-recycle pool)
+    })
   )
 )
 
