@@ -10,6 +10,9 @@
 (define-constant ERR_MINIMUM_BATCH_SIZE (err u108))
 (define-constant ERR_INVALID_TIER (err u109))
 (define-constant ERR_AUTO_RECYCLE_FAILED (err u110))
+(define-constant ERR_INVALID_SCHEDULE_TIME (err u111))
+(define-constant ERR_SCHEDULE_NOT_FOUND (err u112))
+(define-constant ERR_SCHEDULE_NOT_DUE (err u113))
 
 (define-constant MAX_BATCH_SIZE u50)
 (define-constant MIN_BATCH_SIZE u5)
@@ -26,6 +29,7 @@
 (define-data-var next-transfer-id uint u1)
 (define-data-var total-pools-created uint u0)
 (define-data-var total-volume-processed uint u0)
+(define-data-var next-schedule-id uint u1)
 
 (define-map remittance-pools
   uint
@@ -86,6 +90,17 @@
     tier: (string-ascii 10),
     total-rebates-earned: uint,
     last-updated: uint
+  }
+)
+
+(define-map pool-schedules
+  uint
+  {
+    pool-id: uint,
+    creator: principal,
+    scheduled-block: uint,
+    created-at: uint,
+    status: (string-ascii 10)
   }
 )
 
@@ -549,6 +564,82 @@
       auto-recycle-enabled: (get auto-recycle pool)
     })
   )
+)
+
+(define-public (schedule-pool-processing (pool-id uint) (target-block uint))
+  (let (
+    (pool (unwrap! (map-get? remittance-pools pool-id) ERR_POOL_NOT_FOUND))
+    (schedule-id (var-get next-schedule-id))
+  )
+    (asserts! (is-eq tx-sender (get creator pool)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status pool) "active") ERR_POOL_CLOSED)
+    (asserts! (> target-block stacks-block-height) ERR_INVALID_SCHEDULE_TIME)
+    
+    (map-set pool-schedules schedule-id {
+      pool-id: pool-id,
+      creator: tx-sender,
+      scheduled-block: target-block,
+      created-at: stacks-block-height,
+      status: "pending"
+    })
+    
+    (var-set next-schedule-id (+ schedule-id u1))
+    (ok schedule-id)
+  )
+)
+
+(define-public (execute-scheduled-processing (schedule-id uint))
+  (let (
+    (schedule (unwrap! (map-get? pool-schedules schedule-id) ERR_SCHEDULE_NOT_FOUND))
+    (pool (unwrap! (map-get? remittance-pools (get pool-id schedule)) ERR_POOL_NOT_FOUND))
+  )
+    (asserts! (is-eq (get status schedule) "pending") ERR_ALREADY_PROCESSED)
+    (asserts! (>= stacks-block-height (get scheduled-block schedule)) ERR_SCHEDULE_NOT_DUE)
+    (asserts! (is-eq (get status pool) "active") ERR_POOL_CLOSED)
+    (asserts! (>= (get batch-count pool) MIN_BATCH_SIZE) ERR_MINIMUM_BATCH_SIZE)
+    
+    (map-set pool-schedules schedule-id (merge schedule {
+      status: "executed"
+    }))
+    
+    (map-set remittance-pools (get pool-id schedule) (merge pool {
+      status: "processed",
+      processed-at: (some stacks-block-height)
+    }))
+    
+    (var-set total-volume-processed (+ (var-get total-volume-processed) (get total-amount pool)))
+    (ok (get total-amount pool))
+  )
+)
+
+(define-public (cancel-scheduled-processing (schedule-id uint))
+  (let ((schedule (unwrap! (map-get? pool-schedules schedule-id) ERR_SCHEDULE_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get creator schedule)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status schedule) "pending") ERR_ALREADY_PROCESSED)
+    
+    (map-set pool-schedules schedule-id (merge schedule {
+      status: "cancelled"
+    }))
+    (ok true)
+  )
+)
+
+(define-read-only (get-schedule-info (schedule-id uint))
+  (map-get? pool-schedules schedule-id)
+)
+
+(define-read-only (is-schedule-ready (schedule-id uint))
+  (match (map-get? pool-schedules schedule-id)
+    schedule (and 
+               (is-eq (get status schedule) "pending")
+               (>= stacks-block-height (get scheduled-block schedule))
+             )
+    false
+  )
+)
+
+(define-read-only (get-pending-schedules-count)
+  (var-get next-schedule-id)
 )
 
 
