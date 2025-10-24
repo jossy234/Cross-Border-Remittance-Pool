@@ -13,6 +13,9 @@
 (define-constant ERR_INVALID_SCHEDULE_TIME (err u111))
 (define-constant ERR_SCHEDULE_NOT_FOUND (err u112))
 (define-constant ERR_SCHEDULE_NOT_DUE (err u113))
+(define-constant ERR_EMPTY_BATCH (err u114))
+(define-constant ERR_BATCH_TOO_LARGE (err u115))
+(define-constant ERR_DUPLICATE_RECIPIENT (err u116))
 
 (define-constant MAX_BATCH_SIZE u50)
 (define-constant MIN_BATCH_SIZE u5)
@@ -30,6 +33,8 @@
 (define-data-var total-pools-created uint u0)
 (define-data-var total-volume-processed uint u0)
 (define-data-var next-schedule-id uint u1)
+(define-data-var next-batch-transfer-id uint u1)
+(define-data-var total-batch-transfers uint u0)
 
 (define-map remittance-pools
   uint
@@ -101,6 +106,28 @@
     scheduled-block: uint,
     created-at: uint,
     status: (string-ascii 10)
+  }
+)
+
+(define-map batch-transfers
+  uint
+  {
+    sender: principal,
+    pool-id: uint,
+    recipient-count: uint,
+    total-amount: uint,
+    total-fees: uint,
+    created-at: uint,
+    status: (string-ascii 10)
+  }
+)
+
+(define-map batch-transfer-recipients
+  {batch-id: uint, recipient-index: uint}
+  {
+    recipient: (string-ascii 50),
+    amount: uint,
+    transfer-id: uint
   }
 )
 
@@ -640,6 +667,148 @@
 
 (define-read-only (get-pending-schedules-count)
   (var-get next-schedule-id)
+)
+
+(define-private (check-duplicate-recipient (recipient (string-ascii 50)) (recipient-list (list 20 (string-ascii 50))))
+  (is-some (index-of recipient-list recipient))
+)
+
+(define-private (process-single-batch-recipient (recipient-data {recipient: (string-ascii 50), amount: uint}) (context {pool-id: uint, batch-id: uint, sender: principal, index: uint, total-fees: uint, transfer-ids: (list 20 uint)}))
+  (let (
+    (pool (unwrap-panic (map-get? remittance-pools (get pool-id context))))
+    (transfer-id (var-get next-transfer-id))
+    (fee (calculate-discounted-fee (get amount recipient-data) (get sender context)))
+    (recipient-index (get index context))
+  )
+    (map-set pool-transfers {pool-id: (get pool-id context), transfer-id: transfer-id} {
+      sender: (get sender context),
+      recipient: (get recipient recipient-data),
+      amount: (get amount recipient-data),
+      fee: fee,
+      status: "pending",
+      created-at: stacks-block-height,
+      processed-at: none
+    })
+    
+    (map-set batch-transfer-recipients {batch-id: (get batch-id context), recipient-index: recipient-index} {
+      recipient: (get recipient recipient-data),
+      amount: (get amount recipient-data),
+      transfer-id: transfer-id
+    })
+    
+    (map-set remittance-pools (get pool-id context) (merge pool {
+      total-amount: (+ (get total-amount pool) (get amount recipient-data)),
+      fee-collected: (+ (get fee-collected pool) fee),
+      batch-count: (+ (get batch-count pool) u1)
+    }))
+    
+    (let ((participant-key {pool-id: (get pool-id context), participant: (get sender context)}))
+      (match (map-get? pool-participants participant-key)
+        existing-participant (map-set pool-participants participant-key {
+          total-sent: (+ (get total-sent existing-participant) (get amount recipient-data)),
+          transfer-count: (+ (get transfer-count existing-participant) u1),
+          joined-at: (get joined-at existing-participant)
+        })
+        (map-set pool-participants participant-key {
+          total-sent: (get amount recipient-data),
+          transfer-count: u1,
+          joined-at: stacks-block-height
+        })
+      )
+    )
+    
+    (var-set next-transfer-id (+ transfer-id u1))
+    
+    {
+      pool-id: (get pool-id context),
+      batch-id: (get batch-id context),
+      sender: (get sender context),
+      index: (+ recipient-index u1),
+      total-fees: (+ (get total-fees context) fee),
+      transfer-ids: (unwrap-panic (as-max-len? (append (get transfer-ids context) transfer-id) u20))
+    }
+  )
+)
+
+(define-public (add-batch-transfer-to-pool (pool-id uint) (recipients (list 20 {recipient: (string-ascii 50), amount: uint})))
+  (let (
+    (pool (unwrap! (map-get? remittance-pools pool-id) ERR_POOL_NOT_FOUND))
+    (batch-id (var-get next-batch-transfer-id))
+    (recipient-count (len recipients))
+  )
+    (asserts! (> recipient-count u0) ERR_EMPTY_BATCH)
+    (asserts! (<= recipient-count u20) ERR_BATCH_TOO_LARGE)
+    (asserts! (is-eq (get status pool) "active") ERR_POOL_CLOSED)
+    
+    (let (
+      (total-amount (fold + (map get-recipient-amount recipients) u0))
+      (estimated-fees (* recipient-count (calculate-discounted-fee u1000 tx-sender)))
+      (user-balance (default-to u0 (map-get? user-balances tx-sender)))
+    )
+      (asserts! (> total-amount u0) ERR_INVALID_AMOUNT)
+      (asserts! (>= user-balance (+ total-amount estimated-fees)) ERR_INSUFFICIENT_BALANCE)
+      (asserts! (<= (+ (get batch-count pool) recipient-count) (get max-batch-size pool)) ERR_BATCH_FULL)
+      
+      (let (
+        (initial-context {
+          pool-id: pool-id,
+          batch-id: batch-id,
+          sender: tx-sender,
+          index: u0,
+          total-fees: u0,
+          transfer-ids: (list)
+        })
+        (final-context (fold process-single-batch-recipient recipients initial-context))
+      )
+        (let (
+          (actual-total-cost (+ total-amount (get total-fees final-context)))
+        )
+          (update-user-balance tx-sender actual-total-cost "subtract")
+          
+          (map-set batch-transfers batch-id {
+            sender: tx-sender,
+            pool-id: pool-id,
+            recipient-count: recipient-count,
+            total-amount: total-amount,
+            total-fees: (get total-fees final-context),
+            created-at: stacks-block-height,
+            status: "completed"
+          })
+          
+          (update-user-loyalty tx-sender total-amount)
+          (var-set next-batch-transfer-id (+ batch-id u1))
+          (var-set total-batch-transfers (+ (var-get total-batch-transfers) u1))
+          
+          (ok {
+            batch-id: batch-id,
+            recipient-count: recipient-count,
+            total-amount: total-amount,
+            total-fees: (get total-fees final-context),
+            transfer-ids: (get transfer-ids final-context)
+          })
+        )
+      )
+    )
+  )
+)
+
+(define-private (get-recipient-amount (recipient-data {recipient: (string-ascii 50), amount: uint}))
+  (get amount recipient-data)
+)
+
+(define-read-only (get-batch-transfer-info (batch-id uint))
+  (map-get? batch-transfers batch-id)
+)
+
+(define-read-only (get-batch-recipient-info (batch-id uint) (recipient-index uint))
+  (map-get? batch-transfer-recipients {batch-id: batch-id, recipient-index: recipient-index})
+)
+
+(define-read-only (get-batch-transfer-stats)
+  {
+    total-batches: (var-get total-batch-transfers),
+    next-batch-id: (var-get next-batch-transfer-id)
+  }
 )
 
 
