@@ -811,4 +811,79 @@
   }
 )
 
+(define-constant ERR_VOUCHER_NOT_FOUND (err u201))
+(define-constant ERR_VOUCHER_ALREADY_REDEEMED (err u202))
+(define-constant ERR_NOT_VOUCHER_RECIPIENT (err u203))
+(define-constant ERR_NOT_VOUCHER_ISSUER (err u204))
+
+(define-data-var next-voucher-id uint u1)
+
+(define-map remittance-vouchers
+  uint
+  {
+    issuer: principal,
+    recipient: principal,
+    amount: uint,
+    created-at: uint,
+    status: (string-ascii 10)
+  }
+)
+
+(define-public (issue-voucher (amount uint) (recipient principal))
+  (let (
+    (voucher-id (var-get next-voucher-id))
+    (user-balance (default-to u0 (map-get? user-balances tx-sender)))
+  )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= user-balance amount) ERR_INSUFFICIENT_BALANCE)
+    
+    (update-user-balance tx-sender amount "subtract")
+    
+    (map-set remittance-vouchers voucher-id {
+      issuer: tx-sender,
+      recipient: recipient,
+      amount: amount,
+      created-at: stacks-block-height,
+      status: "active"
+    })
+    
+    (var-set next-voucher-id (+ voucher-id u1))
+    (ok voucher-id)
+  )
+)
+
+(define-public (redeem-voucher (voucher-id uint))
+  (let ((voucher (unwrap! (map-get? remittance-vouchers voucher-id) ERR_VOUCHER_NOT_FOUND)))
+    (asserts! (is-eq (get status voucher) "active") ERR_VOUCHER_ALREADY_REDEEMED)
+    (asserts! (is-eq tx-sender (get recipient voucher)) ERR_NOT_VOUCHER_RECIPIENT)
+    
+    (update-user-balance tx-sender (get amount voucher) "add")
+    
+    (map-set remittance-vouchers voucher-id (merge voucher {
+      status: "redeemed"
+    }))
+    
+    (ok (get amount voucher))
+  )
+)
+
+(define-public (cancel-voucher (voucher-id uint))
+  (let ((voucher (unwrap! (map-get? remittance-vouchers voucher-id) ERR_VOUCHER_NOT_FOUND)))
+    (asserts! (is-eq (get status voucher) "active") ERR_VOUCHER_ALREADY_REDEEMED)
+    (asserts! (is-eq tx-sender (get issuer voucher)) ERR_NOT_VOUCHER_ISSUER)
+    
+    (update-user-balance tx-sender (get amount voucher) "add")
+    
+    (map-set remittance-vouchers voucher-id (merge voucher {
+      status: "cancelled"
+    }))
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-voucher-info (voucher-id uint))
+  (map-get? remittance-vouchers voucher-id)
+)
+
 
